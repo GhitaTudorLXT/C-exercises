@@ -4,6 +4,8 @@
 
 #define HASHSIZE 101
 
+#define mark(x) printf("Mark "#x"\n");
+
 typedef struct hash_list hash_list;
 
 struct hash_list
@@ -19,7 +21,7 @@ unsigned int hash (char *s)
 {
 	unsigned int hashval = 0;
 
-	for (; s != '\0'; s++)
+	for (; *s != '\0'; s++)
 		hashval = *s + 31 * hashval;
 
 	return hashval % HASHSIZE;
@@ -97,9 +99,35 @@ int undef(char *name)
 	return 0;
 }
 
+void print_hashtable(char *names[], int el_count)
+{
+	int i;
+	hash_list *node;
+	for (i = 0; i < el_count; i++)
+	{
+		node = lookup(names[i]);
+		printf("%s: %s\n", node != NULL ? node->name : "Name not found", node != NULL ? node->def : "No definition");
+	}
+}
+
 int main()
 {
-	hash_list hn;
+	char *names[] = {"First", "Second", "Not there"};
+
+	int i;
+
+	for (i = 0; i < sizeof(names) / sizeof(char*) - 1; i++)
+	{
+		install(names[i], "definition");
+	}
+
+	print_hashtable(names, sizeof(names) / sizeof(char*));
+
+	undef("First");
+
+	printf("\n");
+
+	print_hashtable(names, sizeof(names) / sizeof(char*));
 
 	return 0;
 }
