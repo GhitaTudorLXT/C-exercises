@@ -6,6 +6,6 @@
 
 int main()
 {
-	printf("%u\n", EOF);
+	printf("%d\n", EOF);
 	return 0;
 }
