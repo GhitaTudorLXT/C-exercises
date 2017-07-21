@@ -1,0 +1,763 @@
+/***************************** FILE HEADER ***********************************/
+/*!
+*  \file		HMCTL_DHCPC.c
+*
+*  \brief		<b>Component control application for DHCP client </b>\n
+*
+*  				
+*
+*
+*  \author		Irina Nicola\n
+*				Copyright 2011 Hirschmann Automation & Control GmbH
+*
+*  \version	1a	2011-10-24 Irina Nicola    created 
+*
+*//**************************** FILE HEADER **********************************/
+
+/******************************************************************************
+* Includes
+******************************************************************************/
+
+#include "hmctl_dhcpc.h"
+
+/******************************************************************************
+* Defines
+******************************************************************************/
+
+/******************************************************************************
+* Local variables
+******************************************************************************/
+
+/******************************************************************************
+* Global variables
+******************************************************************************/
+
+/**
+ * \var			progname
+ *
+ * Program name.
+ */
+const char *progname;
+
+/**
+ * \var
+ *
+ * The pid of the dhclient process that will be monitored by the DHCP client
+ * controller
+ */
+pid_t dhcpc_pid = -1;
+
+/**
+ * \var
+ *
+ * DHCPC process parameters
+ */
+const char *dhcpc_argv[] = {DHCPC_PROCESS, "-cf", DHCPC_CONF_FILE, "-lf", DHCPC_LEASE_FILE, "-sf", DHCPC_SCRIPT_FILE, NULL};
+
+/**
+ * \var			dhcpcConfFile
+ *
+ * Content of the DHCP client configuration file
+ */
+const char *dhcpcConfFile = "request subnet-mask, routers, domain-name-servers, ntp-servers, time-offset, host-name;";
+
+/**
+ * \var			agentx_thread
+ *
+ * DHCP client AgentX thread
+ */
+pthread_t agentx_thread;
+
+
+/******************************************************************************
+* Externals
+******************************************************************************/
+
+/******************************************************************************
+* Local functions
+******************************************************************************/
+
+static int setup_logging();
+static int init_com(const char *arg);
+static int init_snmp();
+static int generate_configuration();
+static int start_work();
+static int stop_work(int sig_type);
+
+static const char *get_program_name(const char *name);
+
+static void sigchld_handler(int sig);
+
+
+/******************************************************************************
+* Global functions
+******************************************************************************/
+
+/******************************************************************************
+ *  \fn					main
+ ******************************************************************************/
+/*!
+ *  \brief				<b>Entry point to the component-control template\n</b>
+ *  
+ *  \return             does not return - daemon-like
+ *
+ *  \author             Irina Nicola
+ *
+ *  \date               2011-10-24
+ ******************************************************************************/
+int main(int argc, char *argv[])
+{	
+	int rc, status, value;
+	HM_ESM_STATE_t current_state;		/* state of this component */
+	HM_ESM_STATE_t system_state;		/* state messsage received from ESM */
+	struct sigaction sa;			/* for SIGCHLD - process monitoring */
+	struct hm_esm_data_t event_data;	/* ESM event data */
+
+	/* endless loop for component-control simple state machine */
+	current_state = HM_ESM_STATE_INIT;
+
+	for (;;) {
+		switch ( current_state ) {
+			/********************************************************************************
+			 * STATE INIT - first state
+			 * - setup logging
+			 * - initialize any other data/devices required
+			 * - store program name (needed for generating state events) 
+			 * - initialize communication with the ESM
+			 * - setup SNMP
+			 *
+			 *   NOTE: this state is entered only once, at system startup
+			 */
+			case HM_ESM_STATE_INIT:
+				/* setup logging */
+				if ( setup_logging() != HM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: setting up logging failed");
+					current_state = HM_ESM_STATE_FAULT;
+					break;
+				}
+
+				syslog(LOG_INFO,"HMCTL_DHCPC main: start of state %s", 
+						hm_esm_state_print(current_state) );
+
+				/* initialize communication with the ESM 
+				 * - this starts a separate thread for dbus communication 
+				 */
+				if ( init_com(argv[0]) != HM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: initializing communication failed"); 	
+					current_state = HM_ESM_STATE_FAULT; 
+					break; 
+				}
+
+				/* SNMP thread 
+				 * - start AgentX subagent here
+				 */
+				if ( init_snmp() != HM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: initializing SNMP failed");
+					current_state = HM_ESM_STATE_FAULT; 
+					break; 
+				}
+
+				/* setup monitoring of work-module
+				 * ex: signal handler
+				 */
+				memset(&sa, 0, sizeof(sa));
+				sa.sa_handler = sigchld_handler;
+				if ( sigaction(SIGCHLD, &sa, NULL ) == -1 ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: setting SIGCHLD handler failed");
+					current_state = HM_ESM_STATE_FAULT; 
+					break; 
+				}
+
+				/* do other initialization actions, if needed
+				 * ...
+				 */
+
+				/* set status of this component to OK */
+				value = HM_ESM_CTRL_STATUS_OK;
+				if ( hm_esm_event_send(hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+							&value) != HM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: sending event(%s,%d) failed",
+							hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+							value);
+					current_state = HM_ESM_STATE_FAULT; 
+					break; 
+				}
+				SYSLOG_INFO("HMCTL_DHCPC main: set status of this component to HM_ESM_CTRL_STATUS_OK ");
+
+				/* tell the ESM this state is complete and move to the next one 
+				 * - send the message/event CTRL_STARTED
+				 */
+				if ( hm_esm_state_notify(hm_esm_state_event_names[HM_ESM_CTRL_STARTED]) 
+						!= HM_ESM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: notifying ESM with %s failed",
+							hm_esm_state_event_names[HM_ESM_CTRL_STARTED]);
+					current_state = HM_ESM_STATE_FAULT; 
+					break; 
+				}
+				SYSLOG_INFO("HMCTL_DHCPC main: notified ESM with %s", 
+						hm_esm_state_event_names[HM_ESM_CTRL_STARTED]);
+
+				/* move to next state */
+				current_state = HM_ESM_STATE_LOAD_CFG; 
+				break;
+
+			/********************************************************************************
+			 * STATE LOAD_CFG
+			 * - notify ESM we are ready to receive configuration via SNMP (the SNMP thread
+			 *   has been started)
+			 * - wait for state-event from ESM to tell us when the CFG MGR finished loading
+			 *   the configuration into our subtree
+			 * - read the OIDs set and generate the configuration
+			 * - signal the ESM that the configuration is ready
+			 * - wait for state-event from ESM to enter into the next state
+			 */	
+			case HM_ESM_STATE_LOAD_CFG:
+				syslog(LOG_INFO,"HMCTL_DHCPC main: start of state %s", 
+						hm_esm_state_print(current_state) );
+
+				/* notify ESM we are ready to receive configuration */
+				if ( hm_esm_state_notify(hm_esm_state_event_names[HM_ESM_CTRL_WAIT4CFG])
+						!= HM_ESM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: notifying ESM with %s failed",
+							hm_esm_state_event_names[HM_ESM_CTRL_WAIT4CFG]);
+					current_state = HM_ESM_STATE_FAULT; 
+					break; 
+				}
+				syslog(LOG_INFO,"HMCTL_DHCPC main: notified ESM with %s", 
+						hm_esm_state_event_names[HM_ESM_CTRL_WAIT4CFG]);
+
+				/* 
+				 * during this time, the CFG MGR should populate our SNMP sub-tree 
+				 */
+
+				/* wait for event from ESM 
+				 * - HM_ESM_LOAD_CFG means the MIB was populated by the CFG MGR
+				 *   and it can now be used to generate the configuration
+				 * - ...
+				 */
+				system_state = hm_esm_state_recv(0);
+				switch ( system_state ) {
+					case HM_ESM_STATE_INVALID:
+						SYSLOG_ERR("HMCTL_DHCPC main: receiving state event from ESM failed");
+						current_state = HM_ESM_STATE_FAULT;
+						break;
+					case HM_ESM_STATE_LOAD_CFG:
+						; /* as expected; continue with this state */
+						break;
+					case HM_ESM_STATE_FAULT:
+						/* error state transition */
+						current_state = HM_ESM_STATE_FAULT;
+						break;
+					default:
+						/* unknown or unexpected state */
+						syslog(LOG_ERR,"should not get here");
+						assert(FALSE);
+				}
+				syslog(LOG_INFO,"HMCTL_DHCPC main: received from ESM system state %s", 
+						hm_esm_state_names[system_state]);
+
+				/* move to STATE FAULT, if needed */
+				if ( current_state == HM_ESM_STATE_FAULT ) {
+					SYSLOG_INFO("HMCTL_DHCPC main: moving to STATE FAULT");
+					break;
+				}
+
+				/* generate the configuration for the lighttpd web server */
+				if ( generate_configuration() != HM_SUCCESS ) {
+					/* set error status in ESM */
+					SYSLOG_ERR("HMCTL_DHCPC main: generating configuration failed");
+					value = HM_ESM_CTRL_STATUS_CFG_FAILED;
+					if ( hm_esm_event_send(hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+								&value ) != HM_SUCCESS ) {
+						SYSLOG_ERR("HMCTL_DHCPC main: sending event(%s,%d) failed",
+								hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+								value);
+					}
+					current_state = HM_ESM_STATE_FAULT; 
+					break; 
+				}
+
+				/* notify ESM that the configuration is ready */
+				if ( hm_esm_state_notify(hm_esm_state_event_names[HM_ESM_CTRL_CFGREADY])
+						!= HM_ESM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: notifying ESM with %s failed",
+							hm_esm_state_event_names[HM_ESM_CTRL_CFGREADY]);
+					current_state = HM_ESM_STATE_FAULT; 
+					break;
+				}
+				syslog(LOG_INFO,"HMCTL_DHCPC main: notified ESM with %s", 
+						hm_esm_state_event_names[HM_ESM_CTRL_CFGREADY]);
+
+				/* wait for event from ESM 
+				 * - HM_ESM_STATE_RUN means that we can start the work-module
+				 * - ...
+				 */
+				system_state = hm_esm_state_recv(0);
+				switch ( system_state ) {
+					case HM_ESM_STATE_INVALID:
+						SYSLOG_ERR("HMCTL_DHCPC main: receiving state event from ESM failed");
+						current_state = HM_ESM_STATE_FAULT;
+						break;
+					case HM_ESM_STATE_RUN:
+						current_state = HM_ESM_STATE_RUN;
+						break;
+					case HM_ESM_STATE_FAULT:
+						/* error state transition */
+						current_state = HM_ESM_STATE_FAULT;
+						break;
+					default:
+						syslog(LOG_ERR,"should not get here");
+						assert(FALSE);
+				}
+				syslog(LOG_INFO,"HMCTL_DHCPC main: received from ESM system state %s", 
+						hm_esm_state_names[system_state]);
+
+				break;
+
+			/********************************************************************************
+			 * STATE RUN
+			 * - start the work-module (thread/process single/multiple instance)
+			 * - report to the ESM work-module started
+			 * - move to next state (RUNNING)
+			 */
+			case HM_ESM_STATE_RUN:
+				syslog(LOG_INFO,"HMCTL_DHCPC main: start of state %s", 
+						hm_esm_state_print(current_state) );
+
+				/* start the dhclient process */
+				if ( start_work() != HM_SUCCESS ) {
+					/* set error status in ESM */
+					SYSLOG_ERR("HMCTL_DHCPC main: starting work-module failed");
+					value = HM_ESM_CTRL_STATUS_WORK_FAILED;
+					if ( hm_esm_event_send(hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+								&value ) != HM_SUCCESS ) {
+						SYSLOG_ERR("HMCTL_DHCPC main: sending event(%s,%d) failed",
+								hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+								value);
+					}
+					current_state = HM_ESM_STATE_FAULT; 
+					break;
+				}
+		
+				/* notify ESM that the component is running */
+				if ( hm_esm_state_notify(hm_esm_state_event_names[HM_ESM_CTRL_COMPRUNNING])
+						!= HM_ESM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: notifying ESM with %s failed",
+							hm_esm_state_event_names[HM_ESM_CTRL_COMPRUNNING]);
+					current_state = HM_ESM_STATE_FAULT; 
+					break; 
+				}
+				syslog(LOG_INFO,"HMCTL_DHCPC main: notified ESM with %s", 
+						hm_esm_state_event_names[HM_ESM_CTRL_COMPRUNNING]);
+						
+				/* reconfiguration finished */
+				hm_esm_reconf_status = HM_ESM_RECONF_NONE;
+
+				/* move to next state */
+				current_state = HM_ESM_STATE_RUNNING;
+
+				break;
+
+			/********************************************************************************
+			 * STATE RUNNING
+			 * - monitor work module (specific to each component)
+			 * - wait for state events from ESM
+			 */
+			case HM_ESM_STATE_RUNNING:
+				syslog(LOG_INFO,"HMCTL_DHCPC main: start of state %s", 
+						hm_esm_state_print(current_state) );
+				
+				
+				/* wait for event from ESM 
+				 * - HM_ESM_STATE_CONTINUE means that the hm_esm_state_recv function
+				 *   was unblocked by writing on the monitor-pipe (verify status of 
+				 *   work-module(s))
+				 * - HM_ESM_STATE_RUNNING means to continue this state
+				 * - ... 
+				 */
+				for (;;) {
+					system_state = hm_esm_state_recv(1);
+					switch ( system_state ) {
+						case HM_ESM_STATE_INVALID:
+							SYSLOG_ERR("HMCTL_DHCPC main: receiving state event from ESM failed");
+							current_state = HM_ESM_STATE_FAULT;
+							break;
+						case HM_ESM_STATE_CONTINUE:
+							/* monitor pipe triggered 
+							 * - see what happened with the work-module
+							 */
+
+							/* if the work-module failed, you can notify the ESM
+							 * of this with the status event
+							 *
+							 * value = HM_ESM_CTRL_STATUS_WORK_FAILED;
+							 * if ( hm_esm_event_send(
+							 * 			hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+							 * 			&value) != HM_SUCCESS ) {
+							 * 		SYSLOG_ERR("HMCTL_DHCPC main: sending event(%s, %d) failed",
+							 * 			hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+							 * 			value);
+							 * 		exit(EXIT_FAILURE);
+							 * }
+							 */
+
+							break;
+						case HM_ESM_STATE_EVENT:
+							/* an non state-event has been received */
+							/*
+							 *
+							 * react to it here, regenerate configuration,
+							 * restart work module 
+							 * ...
+							 */
+							syslog(LOG_INFO,"HMCTL_DHCPC main: received from ESMMMMMMMMMMM system state %s", 
+							hm_esm_state_names[system_state]);
+
+							current_state = HM_ESM_STATE_RUNNING;
+							break;
+						case HM_ESM_STATE_RUNNING:
+							current_state = HM_ESM_STATE_RUNNING;
+							break;
+						case HM_ESM_STATE_RECONF:
+							/* reconfiguration */
+							current_state = HM_ESM_STATE_RECONF;
+							break;
+						case HM_ESM_STATE_FAULT:
+							/* error state transition */
+							current_state = HM_ESM_STATE_FAULT;
+							break;
+						default:
+							syslog(LOG_ERR,"should not get here");
+							assert(FALSE);
+					}
+					syslog(LOG_INFO,"HMCTL_DHCPC main: received from ESM system state %s", 
+							hm_esm_state_names[system_state]);
+					
+					/* if we should do something else than listen for events */
+					if ( current_state != HM_ESM_STATE_RUNNING ) {
+						break;
+					}
+				}
+				break;
+
+			/********************************************************************************
+			 * STATE RECONF
+			 * - reconfiguration triggered
+			 * - verify that the RECONFIGURATION system event has been set
+			 */
+			case HM_ESM_STATE_RECONF:
+				/* get reconfiguration type */
+				
+				/* do something different if hard or soft reconfiguration
+				 * TO BE DETERMINED
+				 */
+				hm_esm_reconf_status = hm_esm_get_reconf();
+				switch ( hm_esm_reconf_status ){
+					case HM_ESM_RECONF_INVALID:
+					case HM_ESM_RECONF_NONE:
+						/* error in API function or event not set */
+						current_state = HM_ESM_STATE_FAULT;
+						break;
+					case HM_ESM_RECONF_SOFT:
+						/* do something */
+						break;
+					case HM_ESM_RECONF_HARD:
+						/* do something */
+						break;
+					default:
+						/* should not get here */
+						assert(FALSE);
+				}
+
+				/* move to STATE FAULT, if needed */
+				if ( current_state == HM_ESM_STATE_FAULT ) {
+					SYSLOG_INFO("HMCTL_DHCPC main: moving to STATE FAULT");
+					break;
+				}
+
+				/* move to LOAD CFG state */
+				current_state = HM_ESM_STATE_LOAD_CFG;
+				break;
+
+			/********************************************************************************
+			 * STATE FAULT
+			 * - system fault reported 
+			 */
+			case HM_ESM_STATE_FAULT:
+				syslog(LOG_INFO,"HMCTL_DHCPC main: start of state %s", 
+						hm_esm_state_print(current_state) );
+				
+				/*
+				 * cleanup ...
+				 *
+				 */
+
+				/* set status in ESM */
+				value = HM_ESM_CTRL_STATUS_FAULT;
+				if ( hm_esm_event_send(
+							hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+							&value) != HM_SUCCESS ) {
+					SYSLOG_ERR("HMCTL_DHCPC main: sending event(%s, %d) failed",
+							hm_esm_state_event_names[HM_ESM_CTRL_STATUS],
+							value);
+				}
+
+				exit(EXIT_FAILURE);
+				break;
+
+			default:
+				/* should not get here */
+				assert(FALSE);
+		}
+	}
+
+	/* will not reach this point */
+	assert(FALSE);
+
+	return EXIT_FAILURE;
+}
+
+/********************************************************************************
+ *	Setup logging for the controlling component
+ */
+static int setup_logging() {
+	return HM_SUCCESS;
+}
+
+/********************************************************************************
+ *	Initialize communication (dbus)
+ */
+static int init_com(const char *arg) {
+	int rc;
+	SYSLOG_TRACE_FUNCTION_IN;
+
+	/* program name */
+	progname = get_program_name(arg);
+	SYSLOG_INFO("HMCTL_DHCPC main: program name is %s\n", progname);
+
+	/* generate component state-notification events */
+	rc = hm_esm_state_generate_event_names(progname);
+	if ( rc != HM_ESM_SUCCESS ) {
+		SYSLOG_ERR("ERR: failed to generate event names");
+		SYSLOG_TRACE("error");
+		SYSLOG_TRACE_FUNCTION_OUT;
+		return HM_FAILURE;
+	}
+
+	/* component-specific event names */
+	SYSLOG_INFO("HMCTL_DHCPC init-com: events (%s) (%s) (%s) (%s) (%s)",
+			hm_esm_state_event_names[HM_ESM_CTRL_STARTED],
+			hm_esm_state_event_names[HM_ESM_CTRL_WAIT4CFG],
+			hm_esm_state_event_names[HM_ESM_CTRL_CFGREADY],
+			hm_esm_state_event_names[HM_ESM_CTRL_COMPRUNNING],
+			hm_esm_state_event_names[HM_ESM_CTRL_STATUS]
+			);	
+
+	rc = hm_esm_state_register_for_events();
+	if ( rc != HM_ESM_SUCCESS ) {
+		SYSLOG_ERR("ERR: failed to register for state-events");
+		SYSLOG_TRACE("error");
+		SYSLOG_TRACE_FUNCTION_OUT;
+		return HM_FAILURE;
+	}
+	SYSLOG_DEBUG("HMCTL_DHCPC init_com: registered for state events");
+
+	/* register for other events that the component is interested in */
+	/*
+	 * rc = hm_esm_event_register(4, "event1", "event2",
+	 * 			"event3", "event4");
+	 * if ( rc != HM_ESM_SUCCESS ) {
+	 * 		...
+	 * }
+	 */
+
+
+	
+
+	/* start dbus main loop */
+	rc = hm_esm_event_start_main_loop();
+	if ( rc != HM_ESM_SUCCESS ) {
+		SYSLOG_ERR("ERR: failed to start communication loop");
+		SYSLOG_TRACE("error");
+		SYSLOG_TRACE_FUNCTION_OUT;
+		return HM_FAILURE;
+	}
+	SYSLOG_INFO("HMCTL_DHCPC init-com: started communication loop");
+
+	SYSLOG_TRACE_FUNCTION_OUT;
+	return HM_SUCCESS;
+}
+
+/********************************************************************************
+ *	Initialize SNMP agentX
+ */
+static int init_snmp() {
+	SYSLOG_TRACE_FUNCTION_IN;
+	/* block until the SNMP thread registers the handler for the OIDs
+	 * and is ready to start listening for SNMp requests
+	 * 
+	 * hm_esm_block();
+	 */
+#if 0
+	/* Start the agentX thread for DHCP client */
+	pthread_create(&agentx_thread, NULL, start_agentx, NULL);
+	hm_esm_block();
+#endif
+	/*
+	 * in the SNMP thread, be sure to call hm_esm_unblock()
+	 *
+	 * hm_esm_unblock();
+	 */
+
+	SYSLOG_INFO("HMCTL_DHCPC init_snmp: snmp agent started");
+
+	SYSLOG_TRACE_FUNCTION_OUT;
+	return HM_SUCCESS;
+} /* init_snmp() */
+
+/********************************************************************************
+ *	Generate working component configuration
+ */
+static int generate_configuration() {
+	SYSLOG_TRACE_FUNCTION_IN;
+	int fd;
+	
+	/* write the content of the dhclient.conf file */
+	fd = open(DHCPC_CONF_FILE, O_WRONLY | O_CREAT | O_TRUNC , 0666);
+	write(fd, dhcpcConfFile, strlen(dhcpcConfFile)); 
+	close(fd);
+	
+	/* you can differentiate between a system startup configuration 
+	 * and a reconfiguration if necessary
+	 */
+	switch ( hm_esm_reconf_status ){
+		case HM_ESM_RECONF_SOFT:
+		case HM_ESM_RECONF_HARD:
+			/* do something special here */
+			break;
+		case HM_ESM_RECONF_NONE:
+			/* system startup configuration */
+			SYSLOG_DEBUG("HMCTL_DHCPC generate_configuration: initial configuration");
+			break;
+		default:
+			/* should not reach here */
+			assert(FALSE);
+	}
+
+	SYSLOG_TRACE_FUNCTION_OUT;
+	return HM_SUCCESS;
+} /* generate_configuration() */
+
+/********************************************************************************
+ *	Start working module
+ */
+static int start_work() {
+	SYSLOG_TRACE_FUNCTION_IN;
+	int rc;
+	
+	/* see if it is a reconfiguration, reload config 
+	 * - restart
+	 * - send SIGHUP
+	 */
+	if (dhcpc_pid != -1) {
+		/* if the lighttpd process is running, there is a re-configuration */
+
+		/* verify existence of process */
+		rc = kill(dhcpc_pid, 0);
+		if ( rc == -1 && errno == ESRCH ) {
+			/* process does not exist */
+			/* should not reach this */
+			assert(FALSE);
+		}
+				
+		/* verify that this is really a reconfiguration */
+		if ( !( hm_esm_reconf_status == HM_ESM_RECONF_SOFT || 
+				hm_esm_reconf_status == HM_ESM_RECONF_HARD ) ) {
+			assert(FALSE);	
+		}
+	}
+
+	/* or start work-module 
+	 * - process, thread etc
+	 */
+	switch(dhcpc_pid = fork()) {
+		case -1:
+			/* error */
+			SYSLOG_ERR("HMCTL_DHCPC start_work: could not create process");
+			return HM_FAILURE;
+		case 0:
+			/* child */
+			execv(DHCPC_PROCESS, (char * const*)dhcpc_argv);
+
+			/* if the function returns, an error has occured */
+			SYSLOG_ERR("HMCTL_DHCPC error exec-ing (%s)", strerror(errno));
+			exit(EXIT_FAILURE);
+		default:
+			/* parent */
+			SYSLOG_INFO("HMCTL_DHCPC start_work: created child process (pid %ld)", 
+					(long) dhcpc_pid);
+			break;
+	}
+
+	SYSLOG_TRACE_FUNCTION_OUT;
+	return HM_SUCCESS;
+} /* start_work() */
+
+/********************************************************************************
+ *	Get program name
+ */
+static const char * get_program_name(const char *name) {
+	const char * result;
+	
+	assert( name != NULL );
+	assert( strlen(name) > 0 && strcmp(name,"/") != 0 );
+
+	result = strrchr(name, '/');
+	if ( result == NULL ) {
+		return name;
+	} else {
+		result = result + 1;
+	}
+
+	return result;
+} /* get_program_name() */
+
+/********************************************************************************
+ *	Signal handler for SIGCHLD
+ *	- used to monitor the child process (the work-module)
+ */
+static void sigchld_handler(int sig) {
+	int status, rc;
+	pid_t dhcpc_pids;
+
+	while((dhcpc_pids = waitpid(-1, &status, WNOHANG)) > 0) {		
+	}
+} /* sigchld_handler() */
+
+/********************************************************************************
+ *	Stop working module
+ */
+static int stop_work(int sig_type) {
+	int rc;
+
+	if (dhcpc_pid != -1) {
+		/* if the unbound process is running, there is a re-configuration */
+
+		/* verify existence of process */
+		rc = kill(dhcpc_pid, sig_type);
+		if ( rc == -1 && errno == ESRCH ) {
+			/* process does not exist */
+			/* should not reach this */
+			assert(FALSE);
+		}
+		dhcpc_pid = -1;
+	}
+	return HM_SUCCESS;
+} /* stop_work() */
+
+
+
+
+
+
+
